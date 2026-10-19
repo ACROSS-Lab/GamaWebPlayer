@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <title>Add multiple geometries from GeoJSON sources</title>
+        <meta property="og:description" content="Add bus routes and bus stops from GeoJSON sources." />
+        <meta charset='utf-8'>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <link rel='stylesheet' href='https://unpkg.com/maplibre-gl@5.21.0/dist/maplibre-gl.css' />
+        <script src='https://unpkg.com/maplibre-gl@5.21.0/dist/maplibre-gl.js'></script>
+    </head>
+    <body>
+        <div id="map"></div>
+        <div id="simulation-controls" role="toolbar" aria-label="Simulation controls">
+            <span class="simulation-cycle-field">
+                <span>Cycle: </span>
+                <output id="simulation-cycle" aria-label="Current simulation cycle">0</output>
+            </span>
+            <label class="simulation-mode-field">
+                <span>Mode</span>
+                <select id="simulation-mode" aria-label="Simulation play mode">
+                    <option value="step">Synchronous</option>
+                    <option value="play">Asynchronous</option>
+                </select>
+            </label>
+            
+            <button id="simulation-play-pause" class="simulation-control" type="button" aria-label="Play" title="Play">Play</button>
+
+            <button id="simulation-step" class="simulation-control" type="button" aria-label="Step" title="Step">Step</button>
+
+            <button id="simulation-reload" class="simulation-control" type="button" aria-label="Reload" title="Reload">Reload</button>
+        </div>
+        <div id="legend">
+            <div id="layer-panel"><h3>Layers</h3></div>
+        </div>
+
+        <script type="module" src="src/main.js"></script>
+    </body>
+</html>
