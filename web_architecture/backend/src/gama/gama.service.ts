@@ -20,8 +20,8 @@ export class GamaService {
     constructor() {
         this.client = new GamaClient(1000, 'localhost');
         this.modelPath =
-            'C:/workspace/gama/gama.library/models/Toy Models/Waterflow/models/Waterflow Grid Elevation.gaml';
-        this.experimentName = 'hydro';
+            'D:/Data/Master ICT/M2/Internship/ACROSS/6-month contract/ATEST/Code/GamaWebPlayer/ATEST_v0/models/Hanoi FastBathtub Flood Model 1926 Discharge.gaml';
+        this.experimentName = 'fastbathtub_1926_discharge';
         this.speciesList = [];
         this.staticSpecies = [];
         this.dynamicSpecies = [];

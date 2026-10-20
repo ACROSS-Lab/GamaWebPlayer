@@ -1,0 +1,577 @@
+/**
+* Name: HanoiFloodingModel3DBFS
+* BFS / edge-cell variant of the Hanoi 3D flooding model.
+*
+* Spread mechanism is ported from the Quang Binh Three Dimensional Flooding
+* Model: only edge cells push water to dry neighbours, with an incremental
+* edge-update tracker that avoids the full O(N) scan. There is NO flow1/flow2
+* selector and NO diffusion rate. Water moves via two complementary rules:
+*   - Spread (BFS to dry): edge wet cells fill dry neighbours up to just below
+*     the donor's water surface, draining the donor by the same volume.
+*   - Equalise (volume-conserving): wet cells pass volume to their already-
+*     processed wet neighbours of lower surface, halving the head difference
+*     each pass — replaces Quang Binh's artificial rise with real flow.
+*
+* Time stepping: 1 cycle = 1 hour. Total simulation = 15 days (360 cycles).
+* Author: Thanh-Do Nguyen (Nguyen Thanh Do)
+* Tags: flooding, hydrology, 3D, mesh, BFS, volumetric
+*/
+model HanoiFloodingModel3DBFS
+
+global {
+	file river_shapefile <- file("../includes/RedRiver1925.shp");
+	file lakes_shapefile <- file("../includes/Lakes1925.shp");
+	file buildings_shapefile <- file("../includes/Buildings1925.shp");
+	file dykes_shape_file <- shape_file("../includes/Dykes.shp");
+	float dyke_height <- 11.0 min: 0.0 max: 15.0 step: 0.5;             // m, uniform dyke barrier height
+	int resolution_grille <- 50 among: [10, 25, 40, 50];
+	file mnt_csv <- file("../includes/mnt-gz" + resolution_grille + ".csv");
+	geometry shape <- envelope("../includes/mnt-gz" + resolution_grille + ".asc");
+	int nb_cols <- resolution_grille = 10 ? 1283 : (resolution_grille = 25 ? 513 : (resolution_grille = 40 ? 321 : 218));
+	int nb_rows <- resolution_grille = 10 ? 854 : (resolution_grille = 25 ? 342 : (resolution_grille = 40 ? 214 : 142));
+
+	float cell_area <- float(resolution_grille * resolution_grille);
+
+	// Time. Anchored to July 1926 so the recorded breach dates (28-29 Jul) in
+	// Dykes.shp map onto simulation cycles. 15-day run covers 22 Jul - 6 Aug.
+	date starting_date <- date([1926, 7, 22, 0, 0, 0]);
+	float step <- 1 #h;
+	int total_days <- 15;
+	int total_cycles <- total_days * 24;
+
+	// Hydrology state
+	list<cell> drains;
+	list<cell> active_cells;
+	list<cell> river_cells;
+	list<cell> active_water_cells <- [];
+	list<cell> edge_water_cells <- [];
+	float max_altitude;
+	float min_altitude;
+	int neighbours_type <- 8;
+
+	// Parameters
+	bool is_raining <- false;
+	float rain <- 0.01 min: 0.0 max: 10.0 step: 0.01;                   // m / day
+	float water_inp <- 2.0 min: 0.0 max: 10.0 step: 1.0;               // m, initial river depth
+	float flow_rate <- 86400000.0 min: 0.0 max: 2592000000.0 step: 100000.0; // m^3 / day
+	float evaporation <- 0.001 min: 0.0 max: 0.005 step: 0.001;          // m / day
+	bool river_input <- true;
+
+	// Stage cap: historical 1926 Red River peak at the Hanoi (Long Bien) gauge.
+	// 11.93 m on 29-07-1926 was the level at which the left-bank dykes broke at
+	// Gia Quat / Ai Mo / Gia Lam. Used directly as a stage boundary: river cells
+	// cannot rise above it.
+	bool cap_river_stage <- true;
+	float max_river_stage <- 11.93 min: 0.0 max: 50.0 step: 0.01;       // m, water-surface elevation cap
+
+	// Dyke breach event (1926). The dykes are baked into the DEM (their crest is
+	// part of the terrain), so an 11.93 m surface cannot overtop them. A breach
+	// carves a notch through the BREAK=YES segment's footprint AND the levee-foot
+	// cells around it, dropping that terrain to the adjacent channel floor so
+	// water passes through regardless of the (high) DEM dyke crest.
+	bool enable_breaches <- true;
+	int breach_foot_radius <- 1 min: 0 max: 5;                          // cells around the breach also opened (levee foot)
+
+	// The SRTM DEM already contains the dyke crests as terrain, so the spread
+	// barrier must NOT add the_digue.height on top (that double-counts the dyke
+	// and needs ~2x the head to cross). Keep true for this DEM. Set false only
+	// if you switch to a bare-earth DEM where dykes are NOT in the terrain and
+	// the_digue.height must act as the barrier instead.
+	bool dem_contains_dykes <- true;
+
+	// BFS-specific parameters (from the Quang Binh model)
+	float flow_threshold <- 0.01 min: 0.0 max: 1.0 step: 0.001;        // m, min depth needed to spread
+	float min_flow_diff <- 0.000000001 min: 0.0 max: 0.1 step: 0.0000000001;       // m, min surface-vs-terrain head to push
+	float min_visible_depth <- 0.01;                                   // m, render threshold
+
+	string export_dir <- "../exported_results/";
+
+	// 3D mesh fields
+	field elevation_map;
+	field water_field;
+
+	init {
+		matrix mnt_val <- matrix(mnt_csv);
+		elevation_map <- field(nb_cols, nb_rows);
+		water_field <- field(nb_cols, nb_rows);
+
+		ask cell {
+			altitude2 <- mnt_val at {grid_x, grid_y};
+			is_inactive <- altitude2 = -9999.0;
+			if (is_inactive) {
+				altitude2 <- 0;
+			}
+			elevation_map[grid_x, grid_y] <- altitude2;
+		}
+
+		active_cells <- cell where !(each.is_inactive);
+
+		ask active_cells {
+			active_neighbours <- (self neighbors_at 1) where !(each.is_inactive);
+			if (length(active_neighbours) < neighbours_type) {
+				is_drain <- true;
+			}
+		}
+
+		max_altitude <- active_cells max_of (each.altitude2);
+		min_altitude <- active_cells min_of (each.altitude2);
+		write "max_altitude : " + max_altitude + " min_altitude : " + min_altitude;
+		write "cell_area : " + cell_area + " m^2 (resolution " + resolution_grille + " m)";
+
+		ask cell {
+			alt_norm <- 100 * (((altitude2 - min_altitude) / (max_altitude - min_altitude)) ^ 2);
+			water_field[grid_x, grid_y] <- min_altitude - 1.0;
+		}
+
+		create building from: buildings_shapefile with: [height::rnd(10) + 5.0];
+
+		// Dykes act as barriers. Each dyke's footprint cells store the_digue,
+		// and the spread check uses (terrain + the_digue.height) as the head
+		// water has to clear before flowing into the cell.
+		create digue from: dykes_shape_file with: [
+			height::dyke_height,
+			will_break::(string(read("BREAK")) = "YES"),
+			break_date_str::string(read("DATE")),
+			commune::string(read("Commune"))
+		];
+		write "Dyke segments created: " + length(digue)
+			+ " | breach segments (BREAK=YES): " + length(digue where each.will_break)
+			+ " | dyke height = " + dyke_height + " m";
+
+		create river from: river_shapefile {
+			cells_concerned <- cell overlapping self;
+		}
+		river_cells <- remove_duplicates(river accumulate (each.cells_concerned)) where !(each.is_inactive);
+
+		// Seed the river with a flat water SURFACE (not flat depth): pick the
+		// highest river-bed altitude as the reference top, add water_inp, then
+		// give each river cell whatever depth brings it up to that surface.
+		if (river_input and !empty(river_cells)) {
+			float initial_surface <- (river_cells max_of (each.altitude2)) + water_inp;
+			write "Initial river surface elevation: " + initial_surface + " m";
+			ask river_cells {
+				water_volume <- (initial_surface - altitude2) * world.cell_area;
+				is_water <- true;
+				is_river <- true;
+			}
+		}
+
+		// Lake is loaded for display only; no water seeded.
+		create lake from: lakes_shapefile {
+			cells_concerned <- cell overlapping self;
+		}
+
+		drains <- active_cells where (each.is_drain);
+
+		// Build initial active and edge sets from the river seed.
+		active_water_cells <- active_cells where (each.is_water);
+		ask active_water_cells {
+			water_field[grid_x, grid_y] <- altitude2 + water_height;
+			if (!empty(active_neighbours where (!each.is_water))) {
+				is_edge_cell <- true;
+			}
+		}
+		edge_water_cells <- active_water_cells where (each.is_edge_cell);
+
+		write "Active cells: " + length(active_cells)
+			+ " | River cells: " + length(river_cells)
+			+ " | Initial wet cells: " + length(active_water_cells)
+			+ " | Initial edge cells: " + length(edge_water_cells)
+			+ " | Drain cells: " + length(drains);
+		write "Run length: " + total_cycles + " cycles (" + total_days + " days at 1 h/step)";
+	}
+
+	// On the last day, export the final flood result to GeoTIFF (one band).
+	// Runs before pause_at_end (declaration order) so it fires at the final cycle.
+	reflex export_final when: cycle = total_cycles {
+		// Flood DEPTH map (m): 0 on dry land, positive where flooded.
+		ask cell {
+			grid_value <- is_inactive ? -9999.0 : water_height;
+		}
+		string depth_file <- export_dir + "water_depth_final_res" + resolution_grille + "_day" + total_days + ".tif";
+		save cell to: depth_file format: "geotiff";
+		write "Exported final flood DEPTH -> " + depth_file;
+
+		// Water SURFACE elevation (m) where wet, terrain elsewhere (= depth 0).
+		ask cell {
+			grid_value <- is_inactive ? -9999.0 : (altitude2 + water_height);
+		}
+		string surf_file <- export_dir + "water_surface_final_res" + resolution_grille + "_day" + total_days + ".tif";
+		save cell to: surf_file format: "geotiff";
+		write "Exported final water SURFACE -> " + surf_file;
+	}
+
+	reflex pause_at_end when: cycle >= total_cycles {
+		write "Reached " + total_days + " days. Pausing.";
+		do pause;
+	}
+
+	reflex raining when: is_raining {
+		float vol_per_cell <- (rain / 24.0) * cell_area;
+		list<cell> newly_wet <- [];
+		ask active_cells {
+			water_volume <- water_volume + vol_per_cell;
+			if (!is_water and water_height > flow_threshold) {
+				is_water <- true;
+				newly_wet <- newly_wet + self;
+			}
+		}
+		if (!empty(newly_wet)) {
+			active_water_cells <- active_water_cells + newly_wet;
+			do update_edge_cells(newly_wet, []);
+		}
+	}
+
+	reflex river_inflow when: river_input and !empty(river_cells) {
+		float vol_per_cell <- (flow_rate / 24.0) / length(river_cells);
+		ask river_cells {
+			water_volume <- water_volume + vol_per_cell;
+		}
+	}
+
+	// Hold the river at the 1926 historical stage: clamp each river cell's
+	// storage so its surface (altitude2 + water_height) cannot exceed
+	// max_river_stage. The surplus is what historically broke the dykes and
+	// spread onto the floodplain (which fills at naturally lower levels).
+	reflex apply_river_stage_cap when: cap_river_stage and river_input and !empty(river_cells) {
+		ask river_cells {
+			float cap_vol <- max(0.0, (world.max_river_stage - altitude2) * world.cell_area);
+			water_volume <- min(water_volume, cap_vol);
+		}
+	}
+
+	// Fire each historical breach once its recorded date is reached.
+	reflex trigger_dyke_breaches when: enable_breaches {
+		ask digue where (each.will_break and !each.has_broken and each.breach_date != nil) {
+			if (current_date >= breach_date) {
+				do break_dyke;
+			}
+		}
+	}
+
+	reflex adding_input_water {
+		loop so over: source {
+			int n <- length(so.cells_concerned);
+			if (n > 0) {
+				float per_cell <- (so.water_input / 24.0) / n;
+				ask so.cells_concerned {
+					water_volume <- water_volume + per_cell;
+				}
+			}
+		}
+	}
+
+	// BFS spread (edge -> dry) followed by volume-conserving equalisation among wet cells.
+	reflex simulate_water_flow {
+		list<cell> new_water_cells <- [];
+		list<cell> affected_neighbors <- [];
+
+		// Phase 1: SPREAD from edge cells to dry neighbours.
+		ask edge_water_cells {
+			if (water_volume > 0 and water_height > flow_threshold) {
+				float donor_surface <- altitude2 + water_height;
+				list<cell> dry_targets <- active_neighbours where (!each.is_water);
+				ask dry_targets {
+					// DEM already includes the dyke crest; only add the_digue.height
+					// when the DEM is bare-earth (dem_contains_dykes = false).
+					float my_top <- altitude2 + ((world.dem_contains_dykes or the_digue = nil) ? 0.0 : the_digue.height);
+					float head_above_terrain <- donor_surface - my_top;
+					if (head_above_terrain > world.min_flow_diff) {
+						// Quang Binh rule: receiver lands just below donor's surface.
+						float target_height <- max(world.flow_threshold, donor_surface - 0.05 - altitude2);
+						float fill_volume <- target_height * world.cell_area;
+						float available <- min(fill_volume, myself.water_volume);
+						if (available > 0) {
+							myself.water_volume <- myself.water_volume - available;
+							water_volume <- water_volume + available;
+							is_water <- true;
+							new_water_cells <- new_water_cells + self;
+							// Record wet neighbours of the new cell for edge re-evaluation.
+							ask active_neighbours where (each.is_water) {
+								if (!(affected_neighbors contains self)) {
+									affected_neighbors <- affected_neighbors + self;
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Phase 2: incremental edge-set update (only changed cells, per Quang Binh).
+		if (!empty(new_water_cells)) {
+			active_water_cells <- active_water_cells + new_water_cells;
+			do update_edge_cells(new_water_cells, affected_neighbors);
+		}
+
+		// Phase 3: EQUALISE among wet cells (volume-conserving, replaces artificial rise).
+		ask active_water_cells {
+			already <- false;
+		}
+		ask shuffle(active_water_cells) {
+			do equalise_with_wet;
+		}
+	}
+
+	// Mark new water cells as edges if they border any dry cell, and re-check
+	// affected wet neighbours — those that just lost a dry neighbour stop being
+	// edge cells. Mirrors update_edge_cells in the Quang Binh model.
+	action update_edge_cells (list<cell> new_water_cells, list<cell> affected_neighbors) {
+		ask new_water_cells {
+			if (!is_edge_cell and !empty(active_neighbours where (!each.is_water))) {
+				is_edge_cell <- true;
+				edge_water_cells <- edge_water_cells + self;
+			}
+		}
+		ask affected_neighbors {
+			if (is_water and is_edge_cell) {
+				if (empty(active_neighbours where (!each.is_water))) {
+					is_edge_cell <- false;
+					edge_water_cells <- edge_water_cells - self;
+				}
+			}
+		}
+	}
+
+	reflex evaporation {
+		float vol_per_cell <- (evaporation / 24.0) * cell_area;
+		ask active_cells where (each.water_volume > 0) {
+			water_volume <- max(0.0, water_volume - vol_per_cell);
+		}
+	}
+
+	reflex draining {
+		ask drains {
+			water_volume <- 0.0;
+		}
+	}
+
+	reflex update_water_field {
+		ask active_cells {
+			water_field[grid_x, grid_y] <- water_height > min_visible_depth
+				? (altitude2 + water_height)
+				: (altitude2 - 1.0);
+		}
+	}
+
+	// Daily report: flood extent and water-height stats (1 day = 24 cycles).
+	reflex report_daily when: cycle mod 24 = 0 {
+		int day <- int(cycle / 24);
+		list<cell> wet <- active_cells where (each.water_height > min_visible_depth);
+		list<cell> flooded_land <- wet where !(each.is_river);
+		float depth_mean <- empty(flooded_land) ? 0.0 : (flooded_land mean_of each.water_height);
+		float depth_max  <- empty(wet) ? 0.0 : (wet max_of each.water_height);
+		float surf_max   <- empty(wet) ? 0.0 : (wet max_of (each.altitude2 + each.water_height));
+		write "=== Day " + day + " | " + current_date + " (cycle " + cycle + ") ===";
+		write "  Flood area (total wet) : " + ((length(wet) * cell_area / 10000.0) with_precision 1) + " ha"
+			+ " | (" + length(wet) + " cells)";
+		write "  Flood area (land only) : " + ((length(flooded_land) * cell_area / 10000.0) with_precision 1) + " ha"
+			+ " | (" + length(flooded_land) + " cells)";
+		write "  Water depth on land    : mean " + (depth_mean with_precision 2) + " m | max " + (depth_max with_precision 2) + " m";
+		write "  Max water surface elev : " + (surf_max with_precision 2) + " m";
+	}
+
+//	reflex export_water_height when: cycle mod 24 = 0 and cycle <= total_cycles {
+//		int day <- int(cycle / 24);
+//		string day_str <- (day < 10 ? "0" : "") + string(day);
+//		string base_name <- export_dir + "water_height_3D_BFS_res" + resolution_grille + "_day" + day_str;
+//		ask cell {
+//			grid_value <- water_height;
+//		}
+//		save cell to: base_name + ".tif" format: "geotiff";
+//		write "Exported day " + day + " (cycle " + cycle + ") -> " + base_name;
+//	}
+
+	species river {
+		list<cell> cells_concerned;
+
+		aspect geometry {
+			draw shape color: rgb("blue") depth: world.water_inp;
+		}
+	}
+
+	species lake {
+		list<cell> cells_concerned;
+
+		aspect geometry {
+			draw shape color: rgb("green") depth: 0.5;
+		}
+	}
+
+	species building parent: digue frequency: 0 {
+		aspect geometry {
+			draw shape color: rgb("pink") depth: height;
+		}
+	}
+
+	species digue {
+		float height;
+		list<cell> cells_concerned;
+		bool will_break <- false;        // BREAK = "YES" in Dykes.shp
+		string break_date_str;           // DATE = "DD-MM" in Dykes.shp
+		string commune;
+		date breach_date;                // parsed absolute datetime of the breach
+		bool has_broken <- false;
+
+		init {
+			cells_concerned <- cell overlapping self;
+			ask cells_concerned {
+				the_digue <- myself;
+			}
+			// Parse the shapefile "DD-MM" into an absolute 1926 breach datetime.
+			if (will_break and break_date_str != nil and break_date_str != "") {
+				list<string> p <- break_date_str split_with "-";
+				if (length(p) >= 2) {
+					breach_date <- date([1926, int(p[1]), int(p[0]), 6, 0, 0]);
+				}
+			}
+		}
+
+		// Open a gap: the footprint + levee-foot cells (within breach_foot_radius)
+		// are dropped to the lowest adjacent ground (the channel floor) and lose
+		// their barrier flag, so water flows through regardless of the DEM crest.
+		action break_dyke {
+			has_broken <- true;
+			list<cell> footprint <- cells_concerned where !(each.is_inactive);
+			// Grow the breach outward by breach_foot_radius rings, using the cached
+			// radius-1 active_neighbours (neighbors_at with radius>1 throws on this
+			// grid type, so we expand iteratively instead).
+			list<cell> breach_cells <- footprint;
+			loop times: world.breach_foot_radius {
+				breach_cells <- remove_duplicates(breach_cells + (breach_cells accumulate (each.active_neighbours)));
+			}
+			breach_cells <- breach_cells where !(each.is_inactive);
+			// lowest surrounding ground that is NOT in the breach = the channel floor
+			list<cell> ring <- remove_duplicates(
+				breach_cells accumulate (each.active_neighbours)
+			) where !(breach_cells contains each);
+			float floor_alt <- empty(ring) ? (breach_cells min_of each.altitude2) : (ring min_of each.altitude2);
+			ask breach_cells {
+				the_digue <- nil;
+				altitude2 <- min(altitude2, floor_alt);
+				world.elevation_map[grid_x, grid_y] <- altitude2;
+			}
+			// Re-activate spreading: wet cells next to the new gap become edges.
+			ask breach_cells {
+				ask active_neighbours where (each.is_water and !each.is_edge_cell) {
+					is_edge_cell <- true;
+					world.edge_water_cells <- world.edge_water_cells + self;
+				}
+			}
+			height <- 0.0;
+			write "DYKE BREACH @ " + current_date + " | commune " + commune
+				+ " | opened " + length(breach_cells) + " cells down to " + floor_alt + " m";
+		}
+
+		aspect geometry {
+			draw shape color: (has_broken ? rgb("orange") : rgb("red")) depth: height;
+		}
+
+		action destroy_digue {
+			ask cells_concerned {
+				the_digue <- nil;
+			}
+			do die;
+		}
+
+		user_command "Destroy digue" action: destroy_digue;
+	}
+
+	species source {
+		list<cell> cells_concerned <- cell overlapping self;
+		float water_input;  // m^3 / day
+
+		aspect geometry {
+			draw shape + 2.0 color: rgb("green") depth: 1.0;
+		}
+	}
+
+	grid cell width: nb_cols height: nb_rows neighbors: neighbours_type frequency: 0 use_regular_agents: false use_individual_shapes: false {
+		bool is_inactive <- false;
+		float altitude2;
+
+		// Cached active neighbours - computed once during init
+		list<cell> active_neighbours;
+
+		float water_volume <- 0.0 min: 0.0;
+		float water_height -> water_volume / world.cell_area;
+
+		bool is_drain <- false;
+		bool is_water <- false;
+		bool is_river <- false;
+		bool is_edge_cell <- false;
+		float alt_norm <- 0.0;
+		digue the_digue;
+		bool already <- false;
+
+		// Volume-conserving pair equalisation: transfer half the head
+		// difference (in volume) to each already-processed lower wet neighbour.
+		// One pass per cycle; converges over multiple cycles.
+		action equalise_with_wet {
+			if (water_volume > 0) {
+				float my_surface <- altitude2 + water_height;
+				list<cell> wet_lower <- active_neighbours where
+					(each.is_water and each.already and (each.altitude2 + each.water_height) < my_surface);
+				loop n over: shuffle(wet_lower) {
+					float surface_diff <- (altitude2 + water_height) - (n.altitude2 + n.water_height);
+					if (surface_diff > 0) {
+						float volume_transfer <- min(water_volume, surface_diff * world.cell_area / 2.0);
+						water_volume <- water_volume - volume_transfer;
+						n.water_volume <- n.water_volume + volume_transfer;
+					}
+				}
+			}
+			already <- true;
+		}
+	}
+}
+
+experiment main_gui type: gui {
+	parameter "Is raining" var: is_raining;
+	parameter "Rain (m/day)" var: rain;
+	parameter "Initial river depth (m)" var: water_inp;
+	parameter "River flow rate (m^3/day)" var: flow_rate;
+	parameter "Evaporation (m/day)" var: evaporation;
+	parameter "River input enabled" var: river_input;
+	parameter "Cap river at 1926 stage" var: cap_river_stage;
+	parameter "Max river stage (m)" var: max_river_stage;
+	parameter "Enable dyke breaches" var: enable_breaches;
+	parameter "Breach foot radius (cells)" var: breach_foot_radius;
+	parameter "DEM already contains dykes" var: dem_contains_dykes;
+	parameter "Dyke height (m)" var: dyke_height;
+	parameter "Flow threshold (m)" var: flow_threshold;
+	parameter "Min flow diff (m)" var: min_flow_diff;
+	parameter "Min visible depth (m)" var: min_visible_depth;
+
+	action _init_ {
+		int resolution <- 0;
+		loop while: (!(resolution in [10, 25, 40, 50])) {
+			map resolution_input <- user_input_dialog("Choose the resolution of the grid among 10, 25, 40, 50 meters", [choose("Choose a value", int, 50, [10, 25, 40, 50])]);
+			resolution <- int(resolution_input["Choose a value"]);
+			if (resolution in [10, 25, 40, 50]) {
+				create simulation with: [resolution_grille::resolution];
+			}
+		}
+	}
+
+	output {
+		display map type: opengl {
+			mesh elevation_map
+				scale: 1
+				grayscale: true
+				smooth: false
+				triangulation: true;
+
+			mesh water_field
+				scale: 1
+				color: rgb(100, 150, 255, 180)
+				smooth: false
+				triangulation: true;
+
+			species river aspect: geometry;
+			species lake aspect: geometry;
+			species building aspect: geometry;
+			species digue aspect: geometry;
+		}
+	}
+}
