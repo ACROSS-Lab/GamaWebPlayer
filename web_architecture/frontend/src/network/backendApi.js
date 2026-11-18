@@ -1,4 +1,6 @@
-const API_BASE = "http://localhost:3000";
+import { BACKEND_URL } from '../config.js';
+
+const API_BASE = BACKEND_URL;
 
 export async function initialize() {
     const response = await post("/simulation/initialize");

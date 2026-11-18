@@ -6,6 +6,7 @@ import { GamaDescription } from './interfaces/gama-description.interface';
 import { GamaSpecies } from './interfaces/gama-species.interface';
 import { GamaMessage } from './interfaces/gama-message.interface';
 import type { MapBounds } from './interfaces/gama-simulation-initialization.interface';
+import { ConfigService } from '@nestjs/config';
 
 @Injectable()
 export class GamaService {
@@ -17,11 +18,17 @@ export class GamaService {
     private dynamicSpecies: string[];
     private hiddenSpecies: string[];
 
-    constructor() {
-        this.client = new GamaClient(1000, 'localhost');
-        this.modelPath =
-            'D:/Data/Master ICT/M2/Internship/ACROSS/6-month contract/ATEST/Code/GamaWebPlayer/ATEST_v0/models/Hanoi FastBathtub Flood Model 1926 Discharge.gaml';
-        this.experimentName = 'fastbathtub_1926_discharge';
+    constructor(private readonly config: ConfigService) {
+        const host = this.config.getOrThrow<string>('GAMA_HOST');
+        const port = Number(this.config.getOrThrow<string>('GAMA_PORT'));
+        if (!Number.isInteger(port) || port < 1 || port > 65535) {
+            throw new Error('GAMA_PORT must be an integer between 1 and 65535.');
+        }
+
+        this.client = new GamaClient(port, host);
+        this.modelPath = this.config.getOrThrow<string>('GAMA_MODEL_PATH');
+        this.experimentName = this.config.getOrThrow<string>('GAMA_EXPERIMENT');
+        
         this.speciesList = [];
         this.staticSpecies = [];
         this.dynamicSpecies = [];

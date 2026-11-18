@@ -9,11 +9,7 @@ import {SimulationState} from "../../common/enums/simulation-state.enum";
 import { SimulationMode } from '../../common/enums/simulation-mode.enum';
 import type { FeatureCollection } from 'geojson';
 
-@WebSocketGateway({
-    cors: {
-        origin: '*',
-    },
-})
+@WebSocketGateway()
 export class SimulationGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @WebSocketServer()
     server!: Server;
