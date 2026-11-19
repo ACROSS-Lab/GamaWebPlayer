@@ -6,3 +6,4 @@ resource/
 ../GAMA/MoovHanoi/includes/GIS/Transport_Network/
 .vscode/
 AGENTS.md
+/.env.compose

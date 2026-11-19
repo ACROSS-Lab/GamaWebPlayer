@@ -1,0 +1,63 @@
+name: gamaweb-local
+
+services:
+    gama:
+        image: gamaplatform/gama@sha256:77e24260cfd779ee255b0461070fc573d118802be0e96857bf17b3644179097d
+        command: ["-m", "2048m", "-socket", "1000"]
+        volumes:
+            -   type: bind
+                source: "${GAMA_PROJECT_DIR:?Set GAMA_PROJECT_DIR}"
+                target: /models/Waterflow
+                read_only: true
+                bind:
+                    create_host_path: false
+        healthcheck:
+            test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/1000"]
+            interval: 5s
+            timeout: 3s
+            retries: 24
+            start_period: 20s
+        restart: unless-stopped
+
+    backend:
+        image: gamaweb-backend:local
+        build: ./backend
+        environment:
+            BACKEND_HOST: 0.0.0.0
+            BACKEND_LISTEN_PORT: "3000"
+            FRONTEND_ORIGINS: "${FRONTEND_ORIGINS:?Set FRONTEND_ORIGINS}"
+            GAMA_HOST: gama
+            GAMA_PORT: "1000"
+            GAMA_MODEL_PATH: "${GAMA_MODEL_PATH:?Set GAMA_MODEL_PATH}"
+            GAMA_EXPERIMENT: "${GAMA_EXPERIMENT:?Set GAMA_EXPERIMENT}"
+        ports:
+            -   "${PUBLISH_HOST:-127.0.0.1}:${BACKEND_HOST_PORT:-3000}:3000"
+        depends_on:
+            gama:
+                condition: service_healthy
+        healthcheck:
+            test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+            interval: 5s
+            timeout: 3s
+            retries: 12
+            start_period: 10s
+        restart: unless-stopped
+
+    frontend:
+        image: gamaweb-frontend:local
+        build:
+            context: ./frontend
+            args:
+                VITE_BACKEND_URL: "${VITE_BACKEND_URL:?Set VITE_BACKEND_URL}"
+        ports:
+            -   "${PUBLISH_HOST:-127.0.0.1}:${FRONTEND_HOST_PORT:-8080}:80"
+        depends_on:
+            backend:
+                condition: service_healthy
+        healthcheck:
+            test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+            interval: 5s
+            timeout: 3s
+            retries: 6
+        restart: unless-stopped
+    
