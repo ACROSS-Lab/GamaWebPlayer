@@ -97,7 +97,7 @@ export class GamaService {
             try {
                 // Case there's an exported list
                 const response = (await this.client.expression(
-                    'species_list',
+                    'simulation.species_list',
                 )) as unknown as GamaMessage<string[]>;
                 orderedSpeciesNames = response.content || [];
             } catch {
@@ -246,7 +246,7 @@ export class GamaService {
     async getCycle(): Promise<number> {
         try {
             const cycle = (await this.client.expression(
-                'cycle',
+                'simulation.cycle',
             )) as unknown as GamaMessage<number>;
             return cycle.content;
         } catch (error) {
@@ -259,7 +259,7 @@ export class GamaService {
     // ===== START: HELPERS =====
     async getMapBounds(): Promise<MapBounds> {
         const response = (await this.client.expression(
-            'to_geojson(world.shape, "EPSG:4326", [])'
+            'to_geojson(simulation.shape, "EPSG:4326", [])'
         ))as unknown as GamaMessage<string>;
 
         const worldGeoJson = typeof response.content === 'string'
@@ -287,7 +287,7 @@ export class GamaService {
 
     async getSpeciesGeoJSON(speciesName: string, properties: string[] = []): Promise<FeatureCollection> {
         const speciesData = (await this.client.expression(
-            `to_geojson(${speciesName}, "EPSG:4326", ${JSON.stringify(properties)})`
+            `to_geojson(simulation.${speciesName}, "EPSG:4326", ${JSON.stringify(properties)})`
         )) as unknown as GamaMessage<string>;
         const content = speciesData.content;
         if (!content || content === "" || content === "null") {
